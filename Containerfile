@@ -1,10 +1,10 @@
 FROM oven/bun:alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-COPY skill-manager/package.json skill-manager/bun.lock* ./
+COPY package.json bun.lock* ./
 RUN bun install
-COPY skill-manager/src/ src/
-COPY skill-manager/tsconfig.json ./
+COPY src/ src/
+COPY tsconfig.json ./
 RUN bun build --compile src/main.ts --outfile skill-manager
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates libstdc++ git
