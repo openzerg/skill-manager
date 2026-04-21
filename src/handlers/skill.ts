@@ -1,106 +1,168 @@
-import { ConnectError, Code } from "@connectrpc/connect"
 import { readFile } from "node:fs/promises"
 import { rmSync } from "node:fs"
 import { join } from "node:path"
-import { randomUUID, now, dbQuery, unwrap } from "./common.js"
-import type { DB } from "../db.js"
-import type { Skill } from "@openzerg/common/entities/skill-schema.js"
+import { ok, err, ResultAsync } from "neverthrow"
+import { ConflictError, NotFoundError, ValidationError, DbError, AppError } from "@openzerg/common"
+import { gelQuery, unwrap, type GelClient } from "@openzerg/common/gel"
+import {
+  listAllSkills,
+  getSkillBySlug,
+  checkSkillSlugExists,
+  getSkillForDelete,
+  insertSkill,
+  updateSkillById,
+  deleteSkillById,
+} from "@openzerg/common/queries"
 import { parseFrontmatter } from "../frontmatter.js"
 import { gitClone, gitPull, gitRevParse } from "../git.js"
 import type {
   RegisterSkillRequest,
   UpdateSkillRequest,
   DeleteSkillRequest,
+  GetSkillRequest,
 } from "@openzerg/common/gen/skillmanager/v1_pb.js"
 
-function skillRowToInfo(s: Skill) {
+type SkillRow = {
+  id: string
+  slug: string
+  name: string
+  description: string
+  gitUrl: string
+  localPath: string
+  commitHash: string
+  pkgs: string
+  createdAt: number
+  updatedAt: number
+}
+
+function skillToInfo(s: SkillRow) {
   return {
-    id: s.id, slug: s.slug, name: s.name, description: s.description,
-    gitUrl: s.gitUrl, localPath: s.localPath, commitHash: s.commitHash,
-    pkgs: s.pkgs, createdAt: s.createdAt, updatedAt: s.updatedAt,
+    id: s.id,
+    slug: s.slug,
+    name: s.name,
+    description: s.description,
+    gitUrl: s.gitUrl,
+    localPath: s.localPath,
+    commitHash: s.commitHash,
+    pkgs: s.pkgs,
+    createdAt: BigInt(s.createdAt),
+    updatedAt: BigInt(s.updatedAt),
   }
 }
 
-export function registerSkillHandlers(db: DB, skillsDir: string) {
+export function registerSkillHandlers(gel: GelClient, skillsDir: string) {
   return {
+
     registerSkill(req: RegisterSkillRequest) {
-      return unwrap(dbQuery(async () => {
-        const existing = await db.selectFrom("registry_skills").select(["id"])
-          .where("slug", "=", req.slug).executeTakeFirst()
-        if (existing) throw new ConnectError(`Skill already exists: ${req.slug}`, Code.AlreadyExists)
-
-        const localPath = join(skillsDir, req.slug)
-        await gitClone(req.gitUrl, localPath)
-
-        const mdRaw = await readFile(join(localPath, "SKILL.md"), "utf-8")
-        const fm = parseFrontmatter(mdRaw)
-        if (!fm) throw new ConnectError("Failed to parse SKILL.md frontmatter", Code.InvalidArgument)
-
-        const commitHash = await gitRevParse(localPath)
-
-        const id = randomUUID()
-        const ts = now()
-        await db.insertInto("registry_skills").values({
-          id, slug: req.slug, name: fm.name, description: fm.description,
-          gitUrl: req.gitUrl, localPath, commitHash, pkgs: JSON.stringify(fm.pkgs),
-          createdAt: ts, updatedAt: ts,
-        }).execute()
-
-        const row = await db.selectFrom("registry_skills").selectAll().where("id", "=", id).executeTakeFirst()
-        return { skill: skillRowToInfo(row!) }
-      }))
+      return unwrap(
+        gelQuery(() => checkSkillSlugExists(gel, { slug: req.slug }))
+          .andThen(existing =>
+            existing
+              ? err(new ConflictError(`Skill already exists: ${req.slug}`))
+              : ok(undefined)
+          )
+          .andThen(() => ResultAsync.fromPromise(
+            (async () => {
+              const localPath = join(skillsDir, req.slug)
+              await gitClone(req.gitUrl, localPath)
+              const mdRaw = await readFile(join(localPath, "SKILL.md"), "utf-8")
+              const fm = parseFrontmatter(mdRaw)
+              if (!fm) throw new ValidationError("Failed to parse SKILL.md frontmatter")
+              const commitHash = await gitRevParse(localPath)
+              return { localPath, fm, commitHash }
+            })(),
+            (e): AppError => e instanceof AppError ? e : new DbError(e instanceof Error ? e.message : String(e))
+          ))
+          .andThen(({ localPath, fm, commitHash }) => {
+            const ts = Date.now()
+            return gelQuery(() => insertSkill(gel, {
+              slug: req.slug,
+              name: fm.name,
+              description: fm.description ?? "",
+              gitUrl: req.gitUrl,
+              localPath,
+              commitHash,
+              pkgs: JSON.stringify(fm.pkgs),
+              createdAt: ts,
+              updatedAt: ts,
+            }))
+          })
+          .andThen(row =>
+            row
+              ? ok({ skill: skillToInfo(row) })
+              : err(new DbError("Insert returned no row"))
+          )
+      )
     },
 
     updateSkill(req: UpdateSkillRequest) {
-      return unwrap(dbQuery(async () => {
-        const row = await db.selectFrom("registry_skills").selectAll()
-          .where("slug", "=", req.slug).executeTakeFirst()
-        if (!row) throw new ConnectError(`Skill not found: ${req.slug}`, Code.NotFound)
-
-        await gitPull(row.localPath)
-
-        const mdRaw = await readFile(join(row.localPath, "SKILL.md"), "utf-8")
-        const fm = parseFrontmatter(mdRaw)
-        if (!fm) throw new ConnectError("Failed to parse SKILL.md frontmatter after pull", Code.Internal)
-
-        const commitHash = await gitRevParse(row.localPath)
-        const ts = now()
-        await db.updateTable("registry_skills").set({
-          name: fm.name, description: fm.description, commitHash,
-          pkgs: JSON.stringify(fm.pkgs), updatedAt: ts,
-        }).where("id", "=", row.id).execute()
-
-        const updated = await db.selectFrom("registry_skills").selectAll().where("id", "=", row.id).executeTakeFirst()
-        return { skill: skillRowToInfo(updated!) }
-      }))
+      return unwrap(
+        gelQuery(() => getSkillBySlug(gel, { slug: req.slug }))
+          .andThen(row =>
+            row ? ok(row) : err(new NotFoundError(`Skill not found: ${req.slug}`))
+          )
+          .andThen(row => ResultAsync.fromPromise(
+            (async () => {
+              await gitPull(row.localPath)
+              const mdRaw = await readFile(join(row.localPath, "SKILL.md"), "utf-8")
+              const fm = parseFrontmatter(mdRaw)
+              if (!fm) throw new ValidationError("Failed to parse SKILL.md frontmatter after pull")
+              const commitHash = await gitRevParse(row.localPath)
+              return { row, fm, commitHash }
+            })(),
+            (e): AppError => e instanceof AppError ? e : new DbError(e instanceof Error ? e.message : String(e))
+          ))
+          .andThen(({ row, fm, commitHash }) => {
+            const ts = Date.now()
+            return gelQuery(() => updateSkillById(gel, {
+              id: row.id,
+              name: fm.name,
+              description: fm.description ?? "",
+              commitHash,
+              pkgs: JSON.stringify(fm.pkgs),
+              updatedAt: ts,
+            }))
+          })
+          .andThen(updated =>
+            updated
+              ? ok({ skill: skillToInfo(updated) })
+              : err(new DbError("Update returned no row"))
+          )
+      )
     },
 
     deleteSkill(req: DeleteSkillRequest) {
-      return unwrap(dbQuery(async () => {
-        const row = await db.selectFrom("registry_skills").selectAll()
-          .where("slug", "=", req.slug).executeTakeFirst()
-        if (!row) throw new ConnectError(`Skill not found: ${req.slug}`, Code.NotFound)
-
-        rmSync(row.localPath, { recursive: true, force: true })
-        await db.deleteFrom("registry_skills").where("id", "=", row.id).execute()
-        return {}
-      }))
+      return unwrap(
+        gelQuery(() => getSkillForDelete(gel, { slug: req.slug }))
+          .andThen(row =>
+            row ? ok(row) : err(new NotFoundError(`Skill not found: ${req.slug}`))
+          )
+          .andThen(row => ResultAsync.fromPromise(
+            (async () => {
+              rmSync(row.localPath, { recursive: true, force: true })
+              await deleteSkillById(gel, { id: row.id })
+              return {}
+            })(),
+            (e): AppError => new DbError(e instanceof Error ? e.message : String(e))
+          ))
+      )
     },
 
     listSkills() {
-      return unwrap(dbQuery(async () => {
-        const rows: Skill[] = await db.selectFrom("registry_skills").selectAll().orderBy("slug", "asc").execute()
-        return { skills: rows.map(skillRowToInfo) }
-      }))
+      return unwrap(
+        gelQuery(() => listAllSkills(gel))
+          .map(rows => ({ skills: rows.map(skillToInfo) }))
+      )
     },
 
-    getSkill(req: { slug: string }) {
-      return unwrap(dbQuery(async () => {
-        const row = await db.selectFrom("registry_skills").selectAll()
-          .where("slug", "=", req.slug).executeTakeFirst()
-        if (!row) throw new ConnectError(`Skill not found: ${req.slug}`, Code.NotFound)
-        return skillRowToInfo(row)
-      }))
+    getSkill(req: GetSkillRequest) {
+      return unwrap(
+        gelQuery(() => getSkillBySlug(gel, { slug: req.slug }))
+          .andThen(row =>
+            row ? ok(skillToInfo(row)) : err(new NotFoundError(`Skill not found: ${req.slug}`))
+          )
+      )
     },
+
   }
 }

@@ -1,17 +1,16 @@
 import { createServer } from "node:http"
 import { connectNodeAdapter } from "@connectrpc/connect-node"
 import { loadConfig } from "./config.js"
-import { openDB, autoMigrate } from "./db.js"
+import { createGelClient } from "@openzerg/common/gel"
 import { createSkillManagerRouter } from "./router.js"
 
 const cfg = loadConfig()
 
 async function main() {
-  await autoMigrate(cfg.databaseURL)
-  const db = openDB(cfg.databaseURL)
+  const gel = createGelClient(cfg.gelDSN)
 
   const handler = connectNodeAdapter({
-    routes: createSkillManagerRouter(db, cfg.skillsDir),
+    routes: createSkillManagerRouter(gel, cfg.skillsDir),
   })
 
   createServer(handler).listen(cfg.port, () => {
